@@ -1,0 +1,74 @@
+package com.busticket.desktop;
+
+import java.awt.*;
+import java.math.BigDecimal;
+import java.sql.*;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.List;
+import javax.swing.*;
+import javax.swing.table.DefaultTableModel;
+
+class AdminPanel extends JPanel {
+    private final Connection db;
+    private final DefaultTableModel model=new DefaultTableModel(new Object[]{"Booking Reference","Passenger","Phone","Route","Departure","Amount","Status","Payment"},0){public boolean isCellEditable(int r,int c){return false;}};
+    private final JTable bookings=new JTable(model);
+    AdminPanel(Connection db){this.db=db;setLayout(new BorderLayout(12,12));setBackground(BusTicketApp.PALE);setBorder(BorderFactory.createEmptyBorder(18,20,18,20));
+        JPanel tools=new JPanel(new GridLayout(3,3,8,8));tools.setOpaque(false);
+        addTool(tools,"Add City",this::addCity);addTool(tools,"Add Bus and Seats",this::addBus);addTool(tools,"Add Route",this::addRoute);addTool(tools,"Add Trip Schedule",this::addSchedule);
+        addTool(tools,"Refresh Bookings",this::loadBookings);addTool(tools,"Cancel Selected Booking",this::cancelSelected);addTool(tools,"Record Payment / Refund",this::updatePayment);addTool(tools,"Cancel Upcoming Trip",this::cancelSchedule);addTool(tools,"Seat Report",this::seatReport);
+        add(tools,BorderLayout.NORTH);bookings.setRowHeight(28);bookings.setAutoCreateRowSorter(true);add(new JScrollPane(bookings),BorderLayout.CENTER);loadBookings();
+    }
+    @FunctionalInterface private interface AdminAction { void run() throws Exception; }
+    private void addTool(JPanel p,String text,AdminAction action){JButton b=BusTicketApp.button(text);b.addActionListener(e->{try{action.run();}catch(Exception ex){showError(ex);}});p.add(b);}
+    private void addCity()throws Exception{
+        JTextField name=new JTextField(),country=new JTextField("Sudan");Object[] fields={"City Name",name,"Country",country};if(JOptionPane.showConfirmDialog(this,fields,"Add City",JOptionPane.OK_CANCEL_OPTION)!=JOptionPane.OK_OPTION)return;
+        try(PreparedStatement p=db.prepareStatement("INSERT INTO cities(city_name,country) VALUES(?,?)")){p.setString(1,name.getText().trim());p.setString(2,country.getText().trim());p.executeUpdate();}commit();JOptionPane.showMessageDialog(this,"City added successfully.");
+    }
+    private void addBus()throws Exception{
+        JTextField number=new JTextField(),name=new JTextField(),count=new JTextField("40");JComboBox<String> type=new JComboBox<>(new String[]{"STANDARD","VIP","SLEEPER","MINI"});Object[] f={"Bus Number",number,"Name",name,"Type",type,"Seat Count (1-100)",count};
+        if(JOptionPane.showConfirmDialog(this,f,"Add Bus",JOptionPane.OK_CANCEL_OPTION)!=JOptionPane.OK_OPTION)return;int total=Integer.parseInt(count.getText());if(total<1||total>100)throw new IllegalArgumentException("Seat count must be between 1 and 100.");
+        db.setAutoCommit(false);long busId;try(PreparedStatement p=db.prepareStatement("INSERT INTO buses(bus_number,bus_name,bus_type,total_seats) VALUES(?,?,?,?)")){p.setString(1,number.getText().trim());p.setString(2,name.getText().trim());p.setString(3,(String)type.getSelectedItem());p.setInt(4,total);p.executeUpdate();}
+        try(PreparedStatement p=db.prepareStatement("SELECT bus_id FROM buses WHERE bus_number=?")){p.setString(1,number.getText().trim());try(ResultSet r=p.executeQuery()){r.next();busId=r.getLong(1);}}
+        String alphabet="ABCDEFGHIJKLMNOPQRSTUVWXYZ";try(PreparedStatement p=db.prepareStatement("INSERT INTO bus_seats(bus_id,seat_number,row_number,column_number,seat_type) VALUES(?,?,?,?,?)")){
+            for(int i=0;i<total;i++){int row=i/4+1,col=i%4+1;p.setLong(1,busId);p.setString(2,""+row+alphabet.charAt(col-1));p.setInt(3,row);p.setInt(4,col);p.setString(5,(col==1||col==4)?"WINDOW":"AISLE");p.addBatch();}p.executeBatch();}
+        commit();JOptionPane.showMessageDialog(this,"Bus and seat layout created successfully.");
+    }
+    private void addRoute()throws Exception{
+        List<CityOption> cities=cities();if(cities.size()<2)throw new IllegalStateException("Add at least two cities.");JComboBox<CityOption> from=new JComboBox<>(cities.toArray(CityOption[]::new)),to=new JComboBox<>(cities.toArray(CityOption[]::new));JTextField distance=new JTextField(),minutes=new JTextField();Object[] f={"From",from,"To",to,"Distance in km (optional)",distance,"Duration in minutes (optional)",minutes};
+        if(JOptionPane.showConfirmDialog(this,f,"Add Route",JOptionPane.OK_CANCEL_OPTION)!=JOptionPane.OK_OPTION)return;CityOption a=(CityOption)from.getSelectedItem(),b=(CityOption)to.getSelectedItem();if(a.id()==b.id())throw new IllegalArgumentException("Select two different cities.");
+        try(PreparedStatement p=db.prepareStatement("INSERT INTO routes(origin_city_id,destination_city_id,distance_km,estimated_minutes) VALUES(?,?,?,?)")){p.setLong(1,a.id());p.setLong(2,b.id());nullableInt(p,3,distance.getText());nullableInt(p,4,minutes.getText());p.executeUpdate();}commit();JOptionPane.showMessageDialog(this,"Route added successfully.");
+    }
+    private void addSchedule()throws Exception{
+        List<RouteOption> routes=routes();List<BusOption> buses=buses();if(routes.isEmpty()||buses.isEmpty())throw new IllegalStateException("Add a route and a bus before creating a schedule.");JComboBox<RouteOption> route=new JComboBox<>(routes.toArray(RouteOption[]::new));JComboBox<BusOption> bus=new JComboBox<>(buses.toArray(BusOption[]::new));JTextField dep=new JTextField(LocalDateTime.now().plusDays(1).withHour(7).withMinute(0).withSecond(0).withNano(0).toString().substring(0,16)),arr=new JTextField(LocalDateTime.now().plusDays(1).withHour(17).withMinute(0).withSecond(0).withNano(0).toString().substring(0,16)),fare=new JTextField("25000");Object[] f={"Route",route,"Bus",bus,"Departure (yyyy-MM-dd HH:mm)",dep,"Arrival (yyyy-MM-dd HH:mm)",arr,"Fare (SDG)",fare};
+        if(JOptionPane.showConfirmDialog(this,f,"Add Trip Schedule",JOptionPane.OK_CANCEL_OPTION)!=JOptionPane.OK_OPTION)return;LocalDateTime d=LocalDateTime.parse(dep.getText().trim(),DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")),a=LocalDateTime.parse(arr.getText().trim(),DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"));if(!a.isAfter(d)||!d.isAfter(LocalDateTime.now()))throw new IllegalArgumentException("Check the departure and arrival times.");
+        try(PreparedStatement p=db.prepareStatement("INSERT INTO schedules(route_id,bus_id,departure_at,arrival_at,base_fare) VALUES(?,?,?,?,?)")){p.setLong(1,((RouteOption)route.getSelectedItem()).id);p.setLong(2,((BusOption)bus.getSelectedItem()).id);p.setTimestamp(3,Timestamp.valueOf(d));p.setTimestamp(4,Timestamp.valueOf(a));p.setBigDecimal(5,new BigDecimal(fare.getText().trim()));p.executeUpdate();}commit();JOptionPane.showMessageDialog(this,"Trip added successfully.");
+    }
+    private void loadBookings(){model.setRowCount(0);String sql="SELECT b.booking_reference,b.passenger_name,b.passenger_phone,c1.city_name||' ← '||c2.city_name,s.departure_at,b.total_amount,b.status,b.payment_status FROM bookings b JOIN schedules s ON s.schedule_id=b.schedule_id JOIN routes r ON r.route_id=s.route_id JOIN cities c1 ON c1.city_id=r.origin_city_id JOIN cities c2 ON c2.city_id=r.destination_city_id ORDER BY b.booked_at DESC";
+        try(Statement s=db.createStatement();ResultSet r=s.executeQuery(sql)){while(r.next())model.addRow(new Object[]{r.getString(1),r.getString(2),r.getString(3),r.getString(4),r.getTimestamp(5),r.getBigDecimal(6),r.getString(7),r.getString(8)});}catch(SQLException e){showError(e);}}
+    private void cancelSelected()throws Exception{int row=bookings.getSelectedRow();if(row<0){JOptionPane.showMessageDialog(this,"Select a booking from the table.");return;}String ref=(String)bookings.getValueAt(bookings.convertRowIndexToModel(row),0);if(JOptionPane.showConfirmDialog(this,"Cancel booking "+ref+"?","Confirm Cancellation",JOptionPane.YES_NO_OPTION)!=JOptionPane.YES_OPTION)return;
+        db.setAutoCommit(false);try(PreparedStatement p=db.prepareStatement("UPDATE bookings SET status='CANCELLED',payment_status=CASE WHEN payment_status='PAID' THEN 'REFUND_PENDING' ELSE payment_status END,cancelled_at=CURRENT_TIMESTAMP WHERE booking_reference=? AND status='CONFIRMED' AND schedule_id IN (SELECT schedule_id FROM schedules WHERE departure_at>CURRENT_TIMESTAMP)")){p.setString(1,ref);int n=p.executeUpdate();if(n==0)throw new IllegalStateException("The booking is inactive or the trip has already departed.");}
+        try(PreparedStatement p=db.prepareStatement("UPDATE booking_seats SET allocation_status='CANCELLED' WHERE booking_id=(SELECT booking_id FROM bookings WHERE booking_reference=?)")){p.setString(1,ref);p.executeUpdate();}commit();loadBookings();}
+    private void updatePayment()throws Exception{int row=bookings.getSelectedRow();if(row<0)throw new IllegalStateException("Select a booking from the table.");int modelRow=bookings.convertRowIndexToModel(row);String ref=(String)bookings.getValueAt(modelRow,0),status=(String)bookings.getValueAt(modelRow,6),payment=(String)bookings.getValueAt(modelRow,7);String next;
+        if("CONFIRMED".equals(status)&&"UNPAID".equals(payment))next="PAID";else if("CANCELLED".equals(status)&&"REFUND_PENDING".equals(payment))next="REFUNDED";else throw new IllegalStateException("No payment update is required for this booking.");
+        if(JOptionPane.showConfirmDialog(this,"Record payment status "+next+" for booking "+ref+"?","Manual Confirmation",JOptionPane.YES_NO_OPTION)!=JOptionPane.YES_OPTION)return;
+        try(PreparedStatement p=db.prepareStatement("UPDATE bookings SET payment_status=? WHERE booking_reference=?")){p.setString(1,next);p.setString(2,ref);p.executeUpdate();}commit();loadBookings();}
+    private void cancelSchedule()throws Exception{List<ScheduleOption> options=schedules();if(options.isEmpty())throw new IllegalStateException("There are no upcoming trips.");JComboBox<ScheduleOption> pick=new JComboBox<>(options.toArray(ScheduleOption[]::new));if(JOptionPane.showConfirmDialog(this,pick,"Select a Trip to Cancel",JOptionPane.OK_CANCEL_OPTION)!=JOptionPane.OK_OPTION)return;ScheduleOption s=(ScheduleOption)pick.getSelectedItem();
+        if(JOptionPane.showConfirmDialog(this,"This trip and its bookings will be cancelled. Continue?","Confirm",JOptionPane.YES_NO_OPTION)!=JOptionPane.YES_OPTION)return;
+        db.setAutoCommit(false);try(PreparedStatement p=db.prepareStatement("UPDATE bookings SET status='CANCELLED',payment_status=CASE WHEN payment_status='PAID' THEN 'REFUND_PENDING' ELSE payment_status END,cancelled_at=CURRENT_TIMESTAMP WHERE schedule_id=? AND status='CONFIRMED'")){p.setLong(1,s.id);p.executeUpdate();}
+        try(PreparedStatement p=db.prepareStatement("UPDATE booking_seats SET allocation_status='CANCELLED' WHERE schedule_id=?")){p.setLong(1,s.id);p.executeUpdate();}
+        try(PreparedStatement p=db.prepareStatement("UPDATE schedules SET status='CANCELLED' WHERE schedule_id=? AND status='SCHEDULED'")){p.setLong(1,s.id);p.executeUpdate();}commit();loadBookings();}
+    private void seatReport()throws Exception{List<ScheduleOption> options=schedules();if(options.isEmpty())throw new IllegalStateException("There are no upcoming trips.");JComboBox<ScheduleOption> pick=new JComboBox<>(options.toArray(ScheduleOption[]::new));if(JOptionPane.showConfirmDialog(this,pick,"Select a Trip",JOptionPane.OK_CANCEL_OPTION)!=JOptionPane.OK_OPTION)return;ScheduleOption s=(ScheduleOption)pick.getSelectedItem();
+        String sql="SELECT z.seat_number,CASE WHEN x.seat_id IS NULL THEN 'Available' ELSE 'Booked' END FROM schedules q JOIN bus_seats z ON z.bus_id=q.bus_id LEFT JOIN booking_seats x ON x.schedule_id=q.schedule_id AND x.seat_id=z.seat_id AND x.allocation_status='BOOKED' WHERE q.schedule_id=? ORDER BY z.row_number,z.column_number";StringBuilder out=new StringBuilder();try(PreparedStatement p=db.prepareStatement(sql)){p.setLong(1,s.id);try(ResultSet r=p.executeQuery()){while(r.next())out.append(r.getString(1)).append("     ").append(r.getString(2)).append('\n');}}JTextArea area=new JTextArea(out.toString(),20,34);area.setEditable(false);JOptionPane.showMessageDialog(this,new JScrollPane(area),"Seat Status Report",JOptionPane.INFORMATION_MESSAGE);}
+    private List<CityOption> cities()throws SQLException{List<CityOption>x=new ArrayList<>();try(Statement s=db.createStatement();ResultSet r=s.executeQuery("SELECT city_id,city_name FROM cities WHERE active='Y' ORDER BY city_name")){while(r.next())x.add(new CityOption(r.getLong(1),r.getString(2)));}return x;}
+    private List<RouteOption> routes()throws SQLException{List<RouteOption>x=new ArrayList<>();try(Statement s=db.createStatement();ResultSet r=s.executeQuery("SELECT r.route_id,c1.city_name,c2.city_name FROM routes r JOIN cities c1 ON c1.city_id=r.origin_city_id JOIN cities c2 ON c2.city_id=r.destination_city_id WHERE r.active='Y' ORDER BY 2,3")){while(r.next())x.add(new RouteOption(r.getLong(1),r.getString(2),r.getString(3)));}return x;}
+    private List<BusOption> buses()throws SQLException{List<BusOption>x=new ArrayList<>();try(Statement s=db.createStatement();ResultSet r=s.executeQuery("SELECT bus_id,bus_number,bus_type,total_seats FROM buses WHERE active='Y' ORDER BY bus_number")){while(r.next())x.add(new BusOption(r.getLong(1),r.getString(2),r.getString(3),r.getInt(4)));}return x;}
+    private List<ScheduleOption> schedules()throws SQLException{List<ScheduleOption>x=new ArrayList<>();try(Statement s=db.createStatement();ResultSet r=s.executeQuery("SELECT s.schedule_id,c1.city_name,c2.city_name,s.departure_at FROM schedules s JOIN routes z ON z.route_id=s.route_id JOIN cities c1 ON c1.city_id=z.origin_city_id JOIN cities c2 ON c2.city_id=z.destination_city_id WHERE s.status='SCHEDULED' AND s.departure_at>CURRENT_TIMESTAMP ORDER BY s.departure_at")){while(r.next())x.add(new ScheduleOption(r.getLong(1),r.getString(2),r.getString(3),r.getTimestamp(4)));}return x;}
+    private void nullableInt(PreparedStatement p,int i,String value)throws SQLException{if(value.isBlank())p.setNull(i,Types.INTEGER);else p.setInt(i,Integer.parseInt(value.trim()));}
+    private void commit()throws SQLException{db.commit();}
+    private void showError(Exception e){JOptionPane.showMessageDialog(this,e.getMessage(),"Error",JOptionPane.ERROR_MESSAGE);try{db.rollback();}catch(SQLException ignored){}}
+    private record RouteOption(long id,String from,String to){public String toString(){return from+" ← "+to;}}
+    private record BusOption(long id,String number,String type,int seats){public String toString(){return number+" | "+type+" | "+seats+" seats";}}
+    private record ScheduleOption(long id,String from,String to,Timestamp time){public String toString(){return from+" ← "+to+" | "+time;}}
+}
